@@ -97,11 +97,10 @@ struct JmpBufStorage {
 
 struct Mark {
     tid: ThreadId,
+    accepts: Option<i32>,
     jmpbuf: JmpBufStorage,
     prev: *mut Mark,
     next: *mut Mark,
-    /// Written by [`recover`] just before its `longjmp`. Read by [`protect`] on
-    /// the recovery path. Uninitialized until then (never read on the Ok path).
     cause: MaybeUninit<i32>,
 }
 
@@ -122,7 +121,8 @@ static REGISTRY: Registry = Registry {
     head: UnsafeCell::new(ptr::null_mut()),
 };
 
-/// Run `f` under recovery protection, tagging this scope with `tid`.
+/// Run `f` under recovery protection, tagging this scope with `tid`. Catches
+/// any cause; see [`protect_cause`] to recover from a single cause only.
 ///
 /// Returns `Ok(value)` on normal completion, or `Err(RecoveryError)` if
 /// [`recover`] (from the fault/OOM handler) jumped into this scope. On the
@@ -181,12 +181,39 @@ pub unsafe fn protect<F, R>(tid: ThreadId, f: F) -> Result<R, RecoveryError>
 where
     F: FnOnce() -> R + UnwindSafe,
 {
+    protect_inner(tid, None, f)
+}
+
+/// Like [`protect`], but only recovers when [`recover`]'s `cause` equals
+/// `cause`; any other cause skips this scope. See [`protect`] for the full
+/// contract.
+pub unsafe fn protect_cause<F, R>(
+    tid: ThreadId,
+    cause: i32,
+    f: F,
+) -> Result<R, RecoveryError>
+where
+    F: FnOnce() -> R + UnwindSafe,
+{
+    protect_inner(tid, Some(cause), f)
+}
+
+// SAFETY: the contract is `protect`'s; the wrappers only pick `accepts`.
+unsafe fn protect_inner<F, R>(
+    tid: ThreadId,
+    accepts: Option<i32>,
+    f: F,
+) -> Result<R, RecoveryError>
+where
+    F: FnOnce() -> R + UnwindSafe,
+{
     let mut payload = CallPayload::<F, R> {
         func: ManuallyDrop::new(f),
         result: MaybeUninit::uninit(),
     };
     let mut mark = Mark {
         tid,
+        accepts,
         jmpbuf: JmpBufStorage::new(),
         prev: ptr::null_mut(),
         next: ptr::null_mut(),
@@ -229,11 +256,12 @@ where
 }
 
 /// From the shared fault/OOM handler: recover the thread identified by `tid` by
-/// jumping into its innermost active [`protect`] scope, reporting `cause`.
+/// jumping into its innermost active scope that accepts `cause`, reporting it.
+/// [`protect`] scopes accept any cause; [`protect_cause`] scopes accept one.
 ///
 /// Diverges on success: the matching [`protect`] returns
-/// `Err(RecoveryError { cause })`. Returns `Err(RecoveryFailure)` if `tid` has no
-/// active scope, so the caller can halt or escalate.
+/// `Err(RecoveryError { cause })`. Returns `Err(RecoveryFailure)` if no active
+/// scope for `tid` accepts `cause`, so the caller can halt or escalate.
 ///
 /// # Safety
 /// - `tid` must identify the thread on whose stack the matching `protect` is
@@ -244,7 +272,7 @@ where
 ///   the fault point and the mark.
 pub unsafe fn recover(tid: ThreadId, cause: i32) -> Result<Infallible, RecoveryFailure> {
     let jb = critical_section::with(|_cs| {
-        let mark = registry_find(tid);
+        let mark = registry_find(tid, cause);
         if mark.is_null() {
             return ptr::null_mut();
         }
@@ -283,10 +311,10 @@ unsafe fn registry_unlink(node: *mut Mark) {
     }
 }
 
-unsafe fn registry_find(tid: ThreadId) -> *mut Mark {
+unsafe fn registry_find(tid: ThreadId, cause: i32) -> *mut Mark {
     let mut p = *REGISTRY.head.get();
     while !p.is_null() {
-        if (*p).tid == tid {
+        if (*p).tid == tid && (*p).accepts.is_none_or(|c| c == cause) {
             return p;
         }
         p = (*p).next;
