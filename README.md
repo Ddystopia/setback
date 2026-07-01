@@ -1,5 +1,8 @@
 # setback
 
+[![docs.rs](https://docs.rs/setback/badge.svg)](https://docs.rs/setback)
+[![crates.io](https://img.shields.io/crates/v/setback.svg)](https://crates.io/crates/setback)
+
 `no_std` failure recovery for Rust built on C `setjmp`/`longjmp`, with all of
 the jump confined to C frames. Set a mark, run a closure, and get `Ok(value)`
 back - or, if a stack overflow, OOM, or explicit trigger fires while it runs,
