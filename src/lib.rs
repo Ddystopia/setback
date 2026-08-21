@@ -46,6 +46,7 @@ use core::ffi::c_void;
 use core::mem::{ManuallyDrop, MaybeUninit};
 use core::panic::UnwindSafe;
 use core::ptr;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 /// Identifier the caller uses to tag a `protect` scope and that the fault
 /// handler uses to find it again. Cast your RTOS task handle / index to `usize`.
@@ -73,6 +74,7 @@ unsafe extern "C" {
     fn setback_jmpbuf_align() -> usize;
     fn setback_call(
         jb: *mut c_void,
+        armed: *mut u8,
         tramp: unsafe extern "C" fn(*mut c_void),
         data: *mut c_void,
     ) -> i32;
@@ -98,6 +100,7 @@ struct JmpBufStorage {
 struct Mark {
     tid: ThreadId,
     accepts: Option<i32>,
+    armed: AtomicU8,
     jmpbuf: JmpBufStorage,
     prev: *mut Mark,
     next: *mut Mark,
@@ -214,6 +217,7 @@ where
     let mut mark = Mark {
         tid,
         accepts,
+        armed: AtomicU8::new(0),
         jmpbuf: JmpBufStorage::new(),
         prev: ptr::null_mut(),
         next: ptr::null_mut(),
@@ -221,11 +225,13 @@ where
     };
     let mark_ptr: *mut Mark = &mut mark;
     let jb = JmpBufStorage::raw(&raw const (*mark_ptr).jmpbuf);
+    let armed = (&raw mut (*mark_ptr).armed).cast::<u8>();
 
     critical_section::with(|_cs| registry_push(mark_ptr));
 
     let outcome = setback_call(
         jb,
+        armed,
         trampoline::<F, R>,
         &mut payload as *mut CallPayload<F, R> as *mut c_void,
     );
@@ -314,7 +320,10 @@ unsafe fn registry_unlink(node: *mut Mark) {
 unsafe fn registry_find(tid: ThreadId, cause: i32) -> *mut Mark {
     let mut p = *REGISTRY.head.get();
     while !p.is_null() {
-        if (*p).tid == tid && (*p).accepts.is_none_or(|c| c == cause) {
+        if (*p).armed.load(Ordering::Acquire) != 0
+            && (*p).tid == tid
+            && (*p).accepts.is_none_or(|c| c == cause)
+        {
             return p;
         }
         p = (*p).next;
@@ -347,5 +356,40 @@ impl Error for RecoveryFailure {}
 impl core::fmt::Display for RecoveryFailure {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "setback recovery failure (no active scope)")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_linked_mark_is_ignored_until_it_is_armed() {
+        const TID: ThreadId = 1234;
+        const CAUSE: i32 = 9;
+
+        let mut mark = Mark {
+            tid: TID,
+            accepts: None,
+            armed: AtomicU8::new(0),
+            jmpbuf: JmpBufStorage::new(),
+            prev: ptr::null_mut(),
+            next: ptr::null_mut(),
+            cause: MaybeUninit::uninit(),
+        };
+        let mark_ptr: *mut Mark = &mut mark;
+
+        let found = || critical_section::with(|_cs| !unsafe { registry_find(TID, CAUSE) }.is_null());
+
+        unsafe {
+            critical_section::with(|_cs| registry_push(mark_ptr));
+            assert!(!found());
+
+            (*mark_ptr).armed.store(1, Ordering::Release);
+            assert!(found());
+
+            critical_section::with(|_cs| registry_unlink(mark_ptr));
+            assert!(!found());
+        }
     }
 }

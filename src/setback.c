@@ -50,6 +50,7 @@ setback_run_with_gap(void (*tramp)(void *), void *data) {
  * Arm the recovery mark, then call the Rust trampoline.
  *
  * jb    : Rust-owned storage of >= setback_jmpbuf_size() bytes.
+ * armed : Rust-owned byte set to 1 once the mark is usable.
  * tramp : extern "C" Rust fn running the closure.
  * data  : opaque payload threaded to the trampoline.
  *
@@ -58,6 +59,7 @@ setback_run_with_gap(void (*tramp)(void *), void *data) {
  * the returns_twice handling.
  */
 __attribute__((noinline)) int setback_call(void *jb,
+                                           unsigned char *armed,
                                            void (*tramp)(void *),
                                            void *data) {
   jmp_buf *env = (jmp_buf *)jb;
@@ -66,12 +68,14 @@ __attribute__((noinline)) int setback_call(void *jb,
    * than in a caller-saved register longjmp clobbered. */
   void (*volatile vtramp)(void *) = tramp;
   void *volatile vdata = data;
+  unsigned char *volatile varmed = armed;
 
   /* setjmp as an `if` controlling expression (legal per C11 7.13.1.1p4). We only
    * need armed (0) vs longjmp-resume (nonzero). The cause travels in the Mark. */
   if (setjmp(*env) == 0) {
-    /* First return: mark armed. Run the closure inside the gap frame, which is
-     * established now, after setjmp. */
+    /* First return: publish the mark, only now usable, to the fault handler.
+     * Then run the closure inside the gap frame, established after setjmp. */
+    __atomic_store_n(varmed, 1, __ATOMIC_RELEASE);
     setback_run_with_gap(vtramp, vdata);
     return SETBACK_OK;
   }
