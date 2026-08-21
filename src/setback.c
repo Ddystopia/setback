@@ -6,8 +6,8 @@
  *
  *  * setjmp() runs in C, never Rust, and only as a controlling
  *    expression (C11 7.13.1.1p4), its result is never stored.
- *  * Anything read after the jump is held in `volatile` temporaries, so longjmp
- *    cannot leave it in a clobbered caller-saved register.
+ *  * No local of the setjmp frame is written after the mark is armed or read on
+ *    the resume path, so none can come back indeterminate (C11 7.13.2.1p3).
  *  * longjmp() unwinds only this C frame back to its setjmp; the abandoned Rust
  *    frames above it are leaked by `protect`'s contract.
  */
@@ -64,19 +64,13 @@ __attribute__((noinline)) int setback_call(void *jb,
                                            void *data) {
   jmp_buf *env = (jmp_buf *)jb;
 
-  /* volatile so a longjmp back into this frame finds these unchanged, rather
-   * than in a caller-saved register longjmp clobbered. */
-  void (*volatile vtramp)(void *) = tramp;
-  void *volatile vdata = data;
-  unsigned char *volatile varmed = armed;
-
   /* setjmp as an `if` controlling expression (legal per C11 7.13.1.1p4). We only
    * need armed (0) vs longjmp-resume (nonzero). The cause travels in the Mark. */
   if (setjmp(*env) == 0) {
     /* First return: publish the mark, only now usable, to the fault handler.
      * Then run the closure inside the gap frame, established after setjmp. */
-    __atomic_store_n(varmed, 1, __ATOMIC_RELEASE);
-    setback_run_with_gap(vtramp, vdata);
+    __atomic_store_n(armed, 1, __ATOMIC_RELEASE);
+    setback_run_with_gap(tramp, data);
     return SETBACK_OK;
   }
 
