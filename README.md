@@ -22,6 +22,9 @@ MMUs should not need this crate.
 - One shared fault handler recovers any task by id: `recover(tid, cause)` jumps
   into that thread's innermost active scope. `cause` is any `i32` whose
   meaning you choose. It resurfaces as `RecoveryError::cause`.
+- A fault handler can look before it leaps: `can_recover(tid, cause)` reports
+  whether `recover` would find a scope, for handlers that pay something
+  irreversible to reach `recover` at all.
 - `no_std` and `no_alloc`. A single `static` intrusive list keyed by thread id
   holds the active marks, based on [`critical-section`].
 - A recovery-stack gap (`RECOVERY_GAP_BYTES`) is reserved below each mark so a

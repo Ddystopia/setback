@@ -28,7 +28,8 @@ rather than entering C.
 The crate owns a single `static` intrusive doubly-linked list of active marks.
 Each [`protect`] call links one node, tagged with the caller's [`ThreadId`], and
 unlinks it on exit. One shared fault handler, given the *faulting* thread's id,
-calls [`recover`] to find that thread's innermost active mark and jump into it.
+calls [`recover`] to find that thread's innermost active mark and jump into it,
+or [`can_recover`] to ask whether such a mark exists without jumping.
 The link/unlink runs inside a [`critical_section`], the protected closure runs
 outside it. You supply the [`critical-section`] impl in the final binary.
 
@@ -46,7 +47,7 @@ use core::ffi::c_void;
 use core::mem::{ManuallyDrop, MaybeUninit};
 use core::panic::UnwindSafe;
 use core::ptr;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 
 /// Identifier the caller uses to tag a `protect` scope and that the fault
 /// handler uses to find it again. Cast your RTOS task handle / index to `usize`.
@@ -103,26 +104,21 @@ struct Mark {
     armed: AtomicU8,
     jmpbuf: JmpBufStorage,
     prev: *mut Mark,
-    next: *mut Mark,
+    /// Atomic because a walk from a fault handler may run concurrently with a
+    /// link/unlink: a critical section cannot exclude a context that preempts
+    /// it, such as an NMI. `prev` stays plain - only the mutators read it, and
+    /// they exclude each other.
+    next: AtomicPtr<Mark>,
     cause: MaybeUninit<i32>,
 }
-
-struct Registry {
-    head: UnsafeCell<*mut Mark>,
-}
-
-// SAFETY: every access runs inside critical_section::with, which the provided
-// impl makes mutually exclusive across all threads and cores.
-unsafe impl Sync for Registry {}
 
 struct CallPayload<F, R> {
     func: ManuallyDrop<F>,
     result: MaybeUninit<R>,
 }
 
-static REGISTRY: Registry = Registry {
-    head: UnsafeCell::new(ptr::null_mut()),
-};
+/// Head of the intrusive list of active marks, most recently linked first.
+static REGISTRY_HEAD: AtomicPtr<Mark> = AtomicPtr::new(ptr::null_mut());
 
 /// Run `f` under recovery protection, tagging this scope with `tid`. Catches
 /// any cause; see [`protect_cause`] to recover from a single cause only.
@@ -220,7 +216,7 @@ where
         armed: AtomicU8::new(0),
         jmpbuf: JmpBufStorage::new(),
         prev: ptr::null_mut(),
-        next: ptr::null_mut(),
+        next: AtomicPtr::new(ptr::null_mut()),
         cause: MaybeUninit::uninit(),
     };
     let mark_ptr: *mut Mark = &mut mark;
@@ -294,31 +290,64 @@ pub unsafe fn recover(tid: ThreadId, cause: i32) -> Result<Infallible, RecoveryF
     setback_longjmp(jb)
 }
 
+/// Whether [`recover`] would find a scope: `true` when `tid` has an active
+/// [`protect`] scope that accepts `cause`.
+///
+/// For a fault handler that must decide *before* it commits to recovery. 
+///
+/// Safe to call from a fault handler, including one that preempts a critical
+/// section.
+pub fn can_recover(tid: ThreadId, cause: i32) -> bool {
+    // SAFETY: `registry_find` needs every node it walks to stay alive, and the
+    // critical section keeps every mutator out for the duration. A caller that
+    // preempts the critical section instead of taking it - a fault handler -
+    // has the mutator stopped mid-`protect`, so its mark cannot go away either.
+    critical_section::with(|_cs| unsafe { !registry_find(tid, cause).is_null() })
+}
+
 unsafe fn registry_push(node: *mut Mark) {
-    let head = *REGISTRY.head.get();
-    (*node).next = head;
+    let head = REGISTRY_HEAD.load(Ordering::Relaxed);
+    (*node).next.store(head, Ordering::Relaxed);
     (*node).prev = ptr::null_mut();
     if !head.is_null() {
         (*head).prev = node;
     }
-    *REGISTRY.head.get() = node;
+    // Release, paired with the load in `registry_find`: the node becomes
+    // reachable only once its `tid`, `accepts` and `next` are visible, so a walk
+    // that reaches it never reads them half-written or follows a stale `next`.
+    REGISTRY_HEAD.store(node, Ordering::Release);
 }
 
 unsafe fn registry_unlink(node: *mut Mark) {
     let prev = (*node).prev;
-    let next = (*node).next;
+    let next = (*node).next.load(Ordering::Relaxed);
     if prev.is_null() {
-        *REGISTRY.head.get() = next;
+        REGISTRY_HEAD.store(next, Ordering::Release);
     } else {
-        (*prev).next = next;
+        (*prev).next.store(next, Ordering::Relaxed);
     }
     if !next.is_null() {
         (*next).prev = prev;
     }
 }
 
+/// Innermost mark for `tid` that accepts `cause`, or null.
+///
+/// # Safety
+///
+/// Every node this walks must stay alive for the walk. Marks live on the
+/// protected thread's stack, so the caller must either hold the critical
+/// section, which keeps every mutator out, or run in a context that cannot be
+/// preempted by one - a fault handler, whose interrupted mutator is stopped
+/// mid-list and cannot return out of its `protect` frame.
 unsafe fn registry_find(tid: ThreadId, cause: i32) -> *mut Mark {
-    let mut p = *REGISTRY.head.get();
+    // Acquire, paired with the stores in `registry_push` / `registry_unlink`.
+    // The links are read atomically because this may interrupt a mutator: a
+    // critical section does not exclude the contexts that call `recover` and
+    // `can_recover`. Walking head -> tail keeps that sound. `registry_push`
+    // publishes the head last, and `registry_unlink` only re-points its
+    // neighbours, so a walk in progress sees either list, never a dangling link.
+    let mut p = REGISTRY_HEAD.load(Ordering::Acquire);
     while !p.is_null() {
         if (*p).armed.load(Ordering::Acquire) != 0
             && (*p).tid == tid
@@ -326,7 +355,7 @@ unsafe fn registry_find(tid: ThreadId, cause: i32) -> *mut Mark {
         {
             return p;
         }
-        p = (*p).next;
+        p = (*p).next.load(Ordering::Relaxed);
     }
     ptr::null_mut()
 }
@@ -374,7 +403,7 @@ mod tests {
             armed: AtomicU8::new(0),
             jmpbuf: JmpBufStorage::new(),
             prev: ptr::null_mut(),
-            next: ptr::null_mut(),
+            next: AtomicPtr::new(ptr::null_mut()),
             cause: MaybeUninit::uninit(),
         };
         let mark_ptr: *mut Mark = &mut mark;
