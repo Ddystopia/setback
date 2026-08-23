@@ -2,13 +2,15 @@
 //! the cause matches, otherwise the scope is skipped just like a foreign-`tid`
 //! mark. A matching cause lands here; a non-matching one resolves to the next
 //! outer accepting scope, or reports `RecoveryFailure` when none accepts it.
+//! A skipped scope on the jumping thread's own stack is abandoned by the jump,
+//! so it leaves the mark list as well.
 //!
 //! Each test uses its own `tid`s, so a `recover` only ever jumps within its own
 //! thread's stack while the global mark list interleaves marks across tests.
 //!
 //! Run with `cargo test --features std`.
 
-use setback::{protect, protect_cause, recover, RecoveryError, RecoveryFailure};
+use setback::{can_recover, protect, protect_cause, recover, RecoveryError, RecoveryFailure};
 
 const OOM: i32 = 2;
 const STACK_OVERFLOW: i32 = 1;
@@ -63,4 +65,52 @@ fn non_matching_inner_resolves_to_outer() {
     };
 
     assert_eq!(outer, Err(RecoveryError { cause: STACK_OVERFLOW }));
+}
+
+/// The jump that skips an inner scope abandons its frame, so the scope's mark
+/// must leave the global list with it: after the outer scope catches, nothing
+/// for this `tid` is left to find.
+#[test]
+fn a_skipped_scope_leaves_the_list_when_the_jump_passes_it() {
+    const TID: usize = 74;
+
+    let outer: Result<(), RecoveryError> = unsafe {
+        protect(TID, || {
+            let _inner: Result<(), RecoveryError> = protect_cause(TID, OOM, || {
+                let _ = recover(TID, STACK_OVERFLOW);
+            });
+            unreachable!("recover jumped to the outer scope, not back here");
+        })
+    };
+
+    assert_eq!(outer, Err(RecoveryError { cause: STACK_OVERFLOW }));
+    // The inner mark would still match here if the jump had left it linked,
+    // and its `jmp_buf` now sits in reusable stack memory.
+    assert!(!can_recover(TID, OOM));
+    assert!(!can_recover(TID, STACK_OVERFLOW));
+}
+
+/// Two nested scopes reject the cause and are both jumped over: neither mark
+/// survives the jump.
+#[test]
+fn every_skipped_scope_leaves_the_list_not_just_the_innermost() {
+    const TID: usize = 75;
+    const TIMEOUT: i32 = 3;
+
+    let outer: Result<(), RecoveryError> = unsafe {
+        protect(TID, || {
+            let _middle: Result<(), RecoveryError> = protect_cause(TID, OOM, || {
+                let _inner: Result<(), RecoveryError> = protect_cause(TID, TIMEOUT, || {
+                    let _ = recover(TID, STACK_OVERFLOW);
+                });
+                unreachable!("the jump passed both inner scopes");
+            });
+            unreachable!("recover jumped to the outer scope, not back here");
+        })
+    };
+
+    assert_eq!(outer, Err(RecoveryError { cause: STACK_OVERFLOW }));
+    assert!(!can_recover(TID, OOM));
+    assert!(!can_recover(TID, TIMEOUT));
+    assert!(!can_recover(TID, STACK_OVERFLOW));
 }

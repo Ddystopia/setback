@@ -14,9 +14,12 @@
 
 #include <setjmp.h>
 #include <stddef.h>
+#include <stdint.h>
 
-/* Returned to Rust by setback_call: OK if the trampoline completed, RECOVERED
- * if a longjmp came back. The cause code travels out of band in the Rust Mark. */
+/* Returned to Rust by setback_call as an int32_t: OK if the trampoline
+ * completed, RECOVERED if a longjmp came back. `int` is 16 bits on some
+ * targets, so the width is pinned to match Rust's `i32` everywhere.
+ * The cause code travels out of band in the Rust Mark. */
 #define SETBACK_OK 0
 #define SETBACK_RECOVERED 1
 
@@ -50,7 +53,9 @@ setback_run_with_gap(void (*tramp)(void *), void *data) {
  * Arm the recovery mark, then call the Rust trampoline.
  *
  * jb    : Rust-owned storage of >= setback_jmpbuf_size() bytes.
- * armed : Rust-owned byte set to 1 once the mark is usable.
+ * armed : Rust-owned `uint8_t` set to 1 once the mark is usable. Exactly 8
+ *         bits wide with no padding and alignment 1, so it matches Rust's
+ *         `u8`/`AtomicU8` on every target where `uint8_t` exists at all.
  * tramp : extern "C" Rust fn running the closure.
  * data  : opaque payload threaded to the trampoline.
  *
@@ -58,10 +63,10 @@ setback_run_with_gap(void (*tramp)(void *), void *data) {
  * here. noinline so the Rust call site cannot be reordered in a way that defeats
  * the returns_twice handling.
  */
-__attribute__((noinline)) int setback_call(void *jb,
-                                           unsigned char *armed,
-                                           void (*tramp)(void *),
-                                           void *data) {
+__attribute__((noinline)) int32_t setback_call(void *jb,
+                                               uint8_t *armed,
+                                               void (*tramp)(void *),
+                                               void *data) {
   jmp_buf *env = (jmp_buf *)jb;
 
   /* setjmp as an `if` controlling expression (legal per C11 7.13.1.1p4). We only

@@ -263,7 +263,11 @@ where
 ///
 /// Diverges on success: the matching [`protect`] returns
 /// `Err(RecoveryError { cause })`. Returns `Err(RecoveryFailure)` if no active
-/// scope for `tid` accepts `cause`, so the caller can halt or escalate.
+/// scope for `tid` accepts `cause`, so the caller can halt or escalate, leaving
+/// every scope live.
+///
+/// Scopes for `tid` nested inside the one it jumps into never return: the jump
+/// abandons their frames and drops their marks from the registry.
 ///
 /// # Safety
 /// - `tid` must identify the thread on whose stack the matching `protect` is
@@ -278,6 +282,9 @@ pub unsafe fn recover(tid: ThreadId, cause: i32) -> Result<Infallible, RecoveryF
         if mark.is_null() {
             return ptr::null_mut();
         }
+        // The jump abandons every scope for `tid` nested inside `mark`; their
+        // marks leave the list here, while it can still be walked safely.
+        registry_unlink_nested(tid, mark);
         // Stash the cause while the node is locked-live, the matching `protect`
         // reads it back after the jump. `recover` runs on the faulting thread
         // and `protect` resumes on it, so the write and read do not race.
@@ -328,6 +335,33 @@ unsafe fn registry_unlink(node: *mut Mark) {
     }
     if !next.is_null() {
         (*next).prev = prev;
+    }
+}
+
+/// Unlink every mark for `tid` that sits ahead of `target` in the list.
+///
+/// A `longjmp` into `target` abandons those scopes' frames without returning
+/// through their `protect`, so nothing else would ever unlink them. For one
+/// `tid` the marks form a LIFO sub-stack, so every mark ahead of `target` is a
+/// scope nested inside it - armed or still arming, both are abandoned by the
+/// jump. Marks for other `tid`s live on other stacks and are left alone.
+///
+/// # Safety
+///
+/// `target` must be a node in the list, and every node this walks must stay
+/// alive for the walk, so the caller must hold the critical section - it keeps
+/// the other mutators out, and this one splices nodes rather than only reading
+/// them, so it cannot run from a context that merely preempts them.
+unsafe fn registry_unlink_nested(tid: ThreadId, target: *mut Mark) {
+    let mut p = REGISTRY_HEAD.load(Ordering::Acquire);
+    while !p.is_null() && p != target {
+        // Read `next` before the splice, so the walk does not rest on what
+        // `registry_unlink` leaves behind in the node it removes.
+        let next = (*p).next.load(Ordering::Relaxed);
+        if (*p).tid == tid {
+            registry_unlink(p);
+        }
+        p = next;
     }
 }
 

@@ -11,6 +11,9 @@
 //!   is doubly linked), which is what lets an inner scope recover and leave
 //!   while the outer one -- now in the middle of the list once other threads
 //!   are present -- stays linked.
+//! * `registry_unlink_nested` runs before the jump: when the walk passes over
+//!   a scope for the same `tid`, the jump abandons that scope's frame, so its
+//!   mark leaves the list too.
 //!
 //! The harness runs each `#[test]` on its own thread, so the protected frames
 //! of different tests live on different stacks. Every test therefore uses its
@@ -19,7 +22,9 @@
 //!
 //! Run with `cargo test --features std`.
 
-use setback::{protect, recover, AssertUnwindSafe, RecoveryError, RecoveryFailure};
+use setback::{
+    can_recover, protect, protect_cause, recover, AssertUnwindSafe, RecoveryError, RecoveryFailure,
+};
 
 /// Recovering from the inner scope lands in the *inner* `protect` (it returns
 /// `Err`) and leaves the outer scope free to run to completion: the jump
@@ -145,4 +150,67 @@ fn find_skips_another_threads_mark_in_the_global_list() {
 
     wake_tx.send(()).unwrap();
     assert_eq!(foreign.join().unwrap(), Ok("foreign ran to completion"));
+}
+
+/// The jump that skips a scope must only drop marks for its own `tid`: a
+/// foreign thread's mark sits at the head, ahead of both of this thread's
+/// marks, and is still live -- and still findable -- once the recovery lands.
+#[test]
+fn a_skipping_jump_leaves_another_threads_mark_alone() {
+    use std::sync::mpsc;
+    use std::thread;
+
+    const MAIN_TID: usize = 300;
+    const FOREIGN_TID: usize = 400;
+    const OOM: i32 = 2;
+    const STACK_OVERFLOW: i32 = 1;
+
+    // main -> foreign: MAIN's marks are linked, you may enter now.
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    // foreign -> main: FOREIGN is now linked at the head.
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    // main -> foreign: recovery is done, you may finish.
+    let (wake_tx, wake_rx) = mpsc::channel::<()>();
+
+    let foreign = thread::spawn(move || unsafe {
+        go_rx.recv().unwrap();
+        // Channels aren't `UnwindSafe`; this scope completes normally (never
+        // recovered), so asserting unwind-safety here is sound.
+        protect(
+            FOREIGN_TID,
+            AssertUnwindSafe(move || {
+                ready_tx.send(()).unwrap(); // FOREIGN now linked at the head
+                wake_rx.recv().unwrap(); // park, keeping this frame -- and its mark -- live
+                "foreign ran to completion"
+            }),
+        )
+    });
+
+    let main: Result<(), RecoveryError> = unsafe {
+        protect(MAIN_TID, || {
+            let _inner: Result<(), RecoveryError> = protect_cause(
+                MAIN_TID,
+                OOM,
+                AssertUnwindSafe(|| {
+                    go_tx.send(()).unwrap(); // both MAIN marks are linked; release foreign
+                    ready_rx.recv().unwrap(); // FOREIGN is now linked above them
+                    // Walk: head FOREIGN (foreign tid) -> inner (rejects) ->
+                    // outer (match). Only `inner` is abandoned by the jump.
+                    let _ = recover(MAIN_TID, STACK_OVERFLOW);
+                }),
+            );
+            unreachable!("recover jumped to the outer scope, not back here");
+        })
+    };
+    assert_eq!(main, Err(RecoveryError { cause: STACK_OVERFLOW }));
+
+    // Sampled while the foreign scope is still parked, asserted after it is
+    // joined: a failing assert here would drop `wake_tx` and strand it.
+    let foreign_linked = can_recover(FOREIGN_TID, 0);
+    let inner_gone = !can_recover(MAIN_TID, OOM);
+
+    wake_tx.send(()).unwrap();
+    assert_eq!(foreign.join().unwrap(), Ok("foreign ran to completion"));
+    assert!(foreign_linked, "the jump unlinked another thread's live mark");
+    assert!(inner_gone, "the skipped scope's mark stayed in the list");
 }
