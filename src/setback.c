@@ -6,10 +6,12 @@
  *
  *  * setjmp() runs in C, never Rust, and only as a controlling
  *    expression (C11 7.13.1.1p4), its result is never stored.
- *  * No local of the setjmp frame is written after the mark is armed or read on
+ *  * No local of the setjmp frame is written after setjmp returns or read on
  *    the resume path, so none can come back indeterminate (C11 7.13.2.1p3).
  *  * longjmp() unwinds only this C frame back to its setjmp; the abandoned Rust
  *    frames above it are leaked by `protect`'s contract.
+ *  * The mark is armed only while the setjmp frame and the recovery stack
+ *    below it are both live.
  */
 
 #include <setjmp.h>
@@ -23,39 +25,52 @@
 #define SETBACK_OK 0
 #define SETBACK_RECOVERED 1
 
-/* Stack reserved below the setjmp mark before the closure runs, so a fault
- * handler has room to run `recover` on abandoned frames - see `protect`'s
- * recovery-stack guarantee. Must equal RECOVERY_GAP_BYTES in lib.rs, multiple of 8. */
-#define SETBACK_RECOVERY_GAP_BYTES 64
+/* Must equal RECOVERY_STACK_BYTES in lib.rs. */
+#define SETBACK_RECOVERY_STACK_BYTES 64
+/* The strictest SP alignment among the supported ABIs. */
+#define SETBACK_RECOVERY_STACK_ALIGN 16
+
+_Static_assert(SETBACK_RECOVERY_STACK_BYTES % SETBACK_RECOVERY_STACK_ALIGN == 0,
+               "the recovery stack top must stay SP-aligned");
+
+struct setback_recovery_stack {
+  _Alignas(SETBACK_RECOVERY_STACK_ALIGN) uint8_t bytes[SETBACK_RECOVERY_STACK_BYTES];
+};
 
 size_t setback_jmpbuf_size(void) { return sizeof(jmp_buf); }
 size_t setback_jmpbuf_align(void) { return _Alignof(jmp_buf); }
 
 /*
- * Run the closure with SETBACK_RECOVERY_GAP_BYTES reserved below the setjmp mark.
+ * Lay the recovery stack down below the setjmp mark, arm the mark with its top,
+ * run the closure, disarm. noinline: the frame holding `rs` must be established
+ * after setback_call's setjmp so it sits below the mark.
  *
- * Must be a separate noinline function: its frame (holding `gap`) is laid down
- * when it is called, after setback_call armed the mark - that ordering is what
- * puts the gap below the mark. `gap` is volatile and touched on both sides of
- * the call so the reservation materializes and stays live (no tail call pops it
- * early); the leading touch faults here, during setup, if headroom is already
- * short on a platform with a stack monitor or guard page.
+ * The probe touches the lowest byte while still unarmed, so a guard that faults
+ * precisely (MPU, PSPLIM, PMP) catches short headroom before there is a mark to
+ * jump into.
  */
 __attribute__((noinline)) static void
-setback_run_with_gap(void (*tramp)(void *), void *data) {
-  volatile unsigned char gap[SETBACK_RECOVERY_GAP_BYTES];
-  gap[0] = 0;
+setback_run_below_recovery_stack(void (*tramp)(void *), void *data,
+                                 uintptr_t *top) {
+  volatile struct setback_recovery_stack rs;
+  rs.bytes[0] = 0;
+  /* C11 does not order a volatile access against a relaxed atomic. */
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
+  __atomic_store_n(top, (uintptr_t)&rs.bytes[SETBACK_RECOVERY_STACK_BYTES],
+                   __ATOMIC_RELAXED);
+  /* Keeps arm and disarm on their side of the call if `tramp` gets inlined. */
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
   tramp(data);
-  (void)gap[0];
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
+  /* Disarm while the setjmp frame is still live. */
+  __atomic_store_n(top, 0, __ATOMIC_RELAXED);
 }
 
 /*
- * Arm the recovery mark, then call the Rust trampoline.
+ * Set the recovery mark, then call the Rust trampoline below the recovery stack.
  *
  * jb    : Rust-owned storage of >= setback_jmpbuf_size() bytes.
- * armed : Rust-owned `uint8_t` set to 1 once the mark is usable. Exactly 8
- *         bits wide with no padding and alignment 1, so it matches Rust's
- *         `u8`/`AtomicU8` on every target where `uint8_t` exists at all.
+ * top   : Rust-owned `uintptr_t`: 0 while unarmed, else the recovery stack top.
  * tramp : extern "C" Rust fn running the closure.
  * data  : opaque payload threaded to the trampoline.
  *
@@ -64,18 +79,16 @@ setback_run_with_gap(void (*tramp)(void *), void *data) {
  * the returns_twice handling.
  */
 __attribute__((noinline)) int32_t setback_call(void *jb,
-                                               uint8_t *armed,
+                                               uintptr_t *top,
                                                void (*tramp)(void *),
                                                void *data) {
   jmp_buf *env = (jmp_buf *)jb;
 
   /* setjmp as an `if` controlling expression (legal per C11 7.13.1.1p4). We only
-   * need armed (0) vs longjmp-resume (nonzero). The cause travels in the Mark. */
+   * need first return (0) vs longjmp-resume (nonzero). The cause travels in the
+   * Mark. */
   if (setjmp(*env) == 0) {
-    /* First return: publish the mark, only now usable, to the fault handler.
-     * Then run the closure inside the gap frame, established after setjmp. */
-    __atomic_store_n(armed, 1, __ATOMIC_RELEASE);
-    setback_run_with_gap(tramp, data);
+    setback_run_below_recovery_stack(tramp, data, top);
     return SETBACK_OK;
   }
 

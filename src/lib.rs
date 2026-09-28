@@ -47,7 +47,7 @@ use core::ffi::c_void;
 use core::mem::{ManuallyDrop, MaybeUninit};
 use core::panic::UnwindSafe;
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 /// Identifier the caller uses to tag a `protect` scope and that the fault
 /// handler uses to find it again. Cast your RTOS task handle / index to `usize`.
@@ -75,7 +75,7 @@ unsafe extern "C" {
     fn setback_jmpbuf_align() -> usize;
     fn setback_call(
         jb: *mut c_void,
-        armed: *mut u8,
+        top: *mut usize,
         tramp: unsafe extern "C" fn(*mut c_void),
         data: *mut c_void,
     ) -> i32;
@@ -84,12 +84,11 @@ unsafe extern "C" {
 
 const SETBACK_OK: i32 = 0;
 
-/// Bytes of stack that [`protect`] reserves below the recovery mark before it
-/// runs the closure - the gap a fault handler may rely on when choosing where
-/// to run [`recover`]. See the "Recovery-stack guarantee" on [`protect`].
+/// Bytes of stack [`protect`] reserves below the mark for a fault handler to
+/// run [`recover`] on. See the "Recovery-stack guarantee" on [`protect`].
 //
-// Must stay equal to `SETBACK_RECOVERY_GAP_BYTES` in `setback.c`.
-pub const RECOVERY_GAP_BYTES: usize = 64;
+// Must equal `SETBACK_RECOVERY_STACK_BYTES` in `setback.c`.
+pub const RECOVERY_STACK_BYTES: usize = 64;
 
 /// Backing storage for one C `jmp_buf`. 512 bytes / 16-byte alignment covers
 /// every mainstream target. The constructor asserts it.
@@ -101,7 +100,8 @@ struct JmpBufStorage {
 struct Mark {
     tid: ThreadId,
     accepts: Option<i32>,
-    armed: AtomicU8,
+    /// Recovery stack top while armed, else `0`. Written by `setback.c` only.
+    recovery_stack_top: AtomicUsize,
     jmpbuf: JmpBufStorage,
     prev: *mut Mark,
     /// Atomic because a walk from a fault handler may run concurrently with a
@@ -141,19 +141,18 @@ static REGISTRY_HEAD: AtomicPtr<Mark> = AtomicPtr::new(ptr::null_mut());
 ///
 /// ## Recovery-stack guarantee
 ///
-/// Before calling `f`, `protect` reserves at least [`RECOVERY_GAP_BYTES`] of
-/// stack between the closure and the recovery mark (the `setjmp` point) and
-/// holds it reserved for the whole run, so `f` never touches it. This gives a
-/// fault handler somewhere to stand: to turn a fault into an `Err`, the handler
-/// resumes the faulting thread and calls [`recover`], which must not overwrite
-/// the mark, the saved `jmp_buf`, or any frame at or before the `protect` call.
-/// Those all sit at or before the mark, and the reserved gap guarantees room
-/// below it - so a handler may land `recover` at the bottom of the thread's
-/// stack and run entirely on abandoned frames.
+/// To turn a fault into an `Err`, a fault handler resumes the faulting thread
+/// and calls [`recover`], which must not overwrite the mark (the `setjmp`
+/// point), the saved `jmp_buf`, or any frame at or before the `protect` call.
 ///
-/// Gap isn't designed to always be a place to run the handler, but it gives you
-/// a guarantee the you can go off [`RECOVERY_GAP_BYTES`] bytes before the stack
-/// bottom.
+/// Before calling `f`, `protect` lays down [`RECOVERY_STACK_BYTES`] of stack
+/// below the mark, touches its lowest byte, then arms the scope until `f`
+/// returns. Given a guard that faults precisely (MPU, `PSPLIM`, PMP), a thread
+/// short on headroom therefore faults while still unarmed. A handler may load
+/// [`recovery_stack_top`] into SP and run `recover` there: the recovery stack
+/// and the abandoned frames of `f` below it are all free. The top is 16-byte
+/// aligned as at a call site, so on x86 a handler that enters a function
+/// directly leaves the return-address slot below it.
 ///
 /// # Safety
 ///
@@ -213,7 +212,7 @@ where
     let mut mark = Mark {
         tid,
         accepts,
-        armed: AtomicU8::new(0),
+        recovery_stack_top: AtomicUsize::new(0),
         jmpbuf: JmpBufStorage::new(),
         prev: ptr::null_mut(),
         next: AtomicPtr::new(ptr::null_mut()),
@@ -221,13 +220,13 @@ where
     };
     let mark_ptr: *mut Mark = &mut mark;
     let jb = JmpBufStorage::raw(&raw const (*mark_ptr).jmpbuf);
-    let armed = (&raw mut (*mark_ptr).armed).cast::<u8>();
+    let top = (&raw mut (*mark_ptr).recovery_stack_top).cast::<usize>();
 
     critical_section::with(|_cs| registry_push(mark_ptr));
 
     let outcome = setback_call(
         jb,
-        armed,
+        top,
         trampoline::<F, R>,
         &mut payload as *mut CallPayload<F, R> as *mut c_void,
     );
@@ -298,18 +297,34 @@ pub unsafe fn recover(tid: ThreadId, cause: i32) -> Result<Infallible, RecoveryF
 }
 
 /// Whether [`recover`] would find a scope: `true` when `tid` has an active
-/// [`protect`] scope that accepts `cause`.
-///
-/// For a fault handler that must decide *before* it commits to recovery. 
-///
-/// Safe to call from a fault handler, including one that preempts a critical
-/// section.
+/// [`protect`] scope that accepts `cause`. Shorthand for
+/// [`recovery_stack_top`]`(tid, cause).is_some()`, safe in the same contexts.
 pub fn can_recover(tid: ThreadId, cause: i32) -> bool {
+    recovery_stack_top(tid, cause).is_some()
+}
+
+/// Top of the recovery stack of the scope [`recover`] would jump into, or
+/// `None` when no active scope for `tid` accepts `cause`. A fault handler
+/// loads it into SP before resuming the thread at code that calls `recover`
+/// with the same `tid` and `cause`, see the "Recovery-stack guarantee" on
+/// [`protect`]. Valid until that scope ends. Safe to call from a
+/// fault handler, including one that preempts a critical section.
+pub fn recovery_stack_top(tid: ThreadId, cause: i32) -> Option<usize> {
     // SAFETY: `registry_find` needs every node it walks to stay alive, and the
     // critical section keeps every mutator out for the duration. A caller that
     // preempts the critical section instead of taking it - a fault handler -
     // has the mutator stopped mid-`protect`, so its mark cannot go away either.
-    critical_section::with(|_cs| unsafe { !registry_find(tid, cause).is_null() })
+    critical_section::with(|_cs| unsafe {
+        let mark = registry_find(tid, cause);
+        if mark.is_null() {
+            return None;
+        }
+        // Another core may have disarmed the scope since the find.
+        match (*mark).recovery_stack_top.load(Ordering::Relaxed) {
+            0 => None,
+            top => Some(top),
+        }
+    })
 }
 
 unsafe fn registry_push(node: *mut Mark) {
@@ -383,7 +398,7 @@ unsafe fn registry_find(tid: ThreadId, cause: i32) -> *mut Mark {
     // neighbours, so a walk in progress sees either list, never a dangling link.
     let mut p = REGISTRY_HEAD.load(Ordering::Acquire);
     while !p.is_null() {
-        if (*p).armed.load(Ordering::Acquire) != 0
+        if (*p).recovery_stack_top.load(Ordering::Relaxed) != 0
             && (*p).tid == tid
             && (*p).accepts.is_none_or(|c| c == cause)
         {
@@ -434,7 +449,7 @@ mod tests {
         let mut mark = Mark {
             tid: TID,
             accepts: None,
-            armed: AtomicU8::new(0),
+            recovery_stack_top: AtomicUsize::new(0),
             jmpbuf: JmpBufStorage::new(),
             prev: ptr::null_mut(),
             next: AtomicPtr::new(ptr::null_mut()),
@@ -448,7 +463,7 @@ mod tests {
             critical_section::with(|_cs| registry_push(mark_ptr));
             assert!(!found());
 
-            (*mark_ptr).armed.store(1, Ordering::Release);
+            (*mark_ptr).recovery_stack_top.store(0x1000, Ordering::Relaxed);
             assert!(found());
 
             critical_section::with(|_cs| registry_unlink(mark_ptr));

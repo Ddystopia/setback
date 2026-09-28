@@ -27,8 +27,8 @@ MMUs should not need this crate.
   irreversible to reach `recover` at all.
 - `no_std` and `no_alloc`. A single `static` intrusive list keyed by thread id
   holds the active marks, based on [`critical-section`].
-- A recovery-stack gap (`RECOVERY_GAP_BYTES`) is reserved below each mark so a
-  fault handler always has stack to run `recover` on.
+- A recovery stack (`RECOVERY_STACK_BYTES`) is reserved below each mark, and
+  `recovery_stack_top(tid, cause)` gives a fault handler an SP to run `recover` on.
 
 [`critical-section`]: https://docs.rs/critical-section/latest/critical_section/
 
@@ -66,7 +66,7 @@ fn parse_config(
 ## Simplified wiring example (you provide the fault handler, stack guard, and CS impl)
 
 ```rust
-use setback::{protect, recover, ThreadId};
+use setback::{protect, recover, recovery_stack_top, ThreadId};
 
 const STACK_OVERFLOW: i32 = 1;
 const OOM: i32 = 2;
@@ -85,13 +85,17 @@ fn oom(_: core::alloc::Layout) -> ! {
 
 // Stack overflow fires in HANDLER MODE on a broken stack. The handler only
 // redirects: rewrite the stacked PSP frame so the exception return resumes at
-// overflow_trampoline in thread mode (see `recover` Safety for the full recipe).
+// overflow_trampoline in thread mode, on the scope's recovery stack.
 unsafe fn on_stack_overflow() {
+    let tid = rtos_current_task() as ThreadId;
+    let Some(sp) = recovery_stack_top(tid, STACK_OVERFLOW) else {
+        halt(); // no scope to recover into
+    };
     let f = __get_PSP() as *mut u32;
-    *f.add(0) = rtos_current_task() as u32;                        // r0 = tid
-    *f.add(1) = STACK_OVERFLOW as u32;                             // r1 = cause
-    *f.add(2) = (rtos_stack_bottom() + RECOVERY_GAP_BYTES) as u32; // r2 = safe SP
-    *f.add(6) = overflow_trampoline as u32;                        // PC
+    *f.add(0) = tid as u32;                    // r0 = tid
+    *f.add(1) = STACK_OVERFLOW as u32;         // r1 = cause
+    *f.add(2) = sp as u32;                     // r2 = recovery stack top
+    *f.add(6) = overflow_trampoline as u32;    // PC
 }
 
 // Reset SP (the overflowed stack is unusable) then enter thread-mode Rust.
