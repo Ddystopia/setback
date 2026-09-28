@@ -1,18 +1,24 @@
 //! `protect` lays down a recovery stack of `RECOVERY_STACK_BYTES` below the
-//! mark and publishes its top for a fault handler to use as SP.
+//! mark, and `prepare_recovery` hands a fault handler its top and a token to
+//! finish the recovery with.
 //!
 //! Run with `cargo test --features std`.
 
 use core::hint::black_box;
 
 use setback::{
-    protect, protect_cause, recovery_stack_top, RECOVERY_STACK_BYTES,
+    can_recover, prepare_recovery, protect, protect_cause, RecoveryError, RECOVERY_STACK_BYTES,
 };
 
 const OOM: i32 = 2;
 const STACK_OVERFLOW: i32 = 1;
+const TIMEOUT: i32 = 3;
 
 const SP_ALIGN: usize = 16;
+
+fn recovery_stack_top(tid: usize, cause: i32) -> Option<usize> {
+    unsafe { prepare_recovery(tid, cause) }.map(|p| p.stack_top())
+}
 
 /// Address of a local in a fresh, un-inlined frame: a stand-in for "the stack
 /// pointer here". `black_box` keeps the probe and its address from folding away.
@@ -82,4 +88,35 @@ fn top_belongs_to_the_scope_recover_would_pick() {
 
     assert!(outer_top > inner_top, "outer={outer_top:#x} inner={inner_top:#x}");
     assert_eq!(picked_for_oom, outer_top);
+}
+
+#[test]
+fn prepared_recovery_lands_in_its_scope() {
+    const TID: usize = 304;
+
+    let r: Result<(), RecoveryError> = unsafe {
+        protect(TID, || prepare_recovery(TID, OOM).unwrap().recover())
+    };
+
+    assert_eq!(r, Err(RecoveryError { cause: OOM }));
+    assert!(!can_recover(TID, OOM));
+}
+
+#[test]
+fn prepared_recovery_drops_the_nested_scopes() {
+    const TID: usize = 305;
+
+    let outer = unsafe {
+        protect_cause(TID, TIMEOUT, || {
+            let mid: Result<(), RecoveryError> = protect_cause(TID, OOM, || {
+                protect_cause(TID, STACK_OVERFLOW, || {
+                    prepare_recovery(TID, OOM).unwrap().recover()
+                })
+                .unwrap()
+            });
+            (mid, can_recover(TID, STACK_OVERFLOW))
+        })
+    };
+
+    assert_eq!(outer, Ok((Err(RecoveryError { cause: OOM }), false)));
 }

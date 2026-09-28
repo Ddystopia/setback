@@ -28,7 +28,8 @@ MMUs should not need this crate.
 - `no_std` and `no_alloc`. A single `static` intrusive list keyed by thread id
   holds the active marks, based on [`critical-section`].
 - A recovery stack (`RECOVERY_STACK_BYTES`) is reserved below each mark, and
-  `recovery_stack_top(tid, cause)` gives a fault handler an SP to run `recover` on.
+  `prepare_recovery(tid, cause)` gives a fault handler an SP and a token that
+  finishes the recovery on it.
 
 [`critical-section`]: https://docs.rs/critical-section/latest/critical_section/
 
@@ -66,7 +67,7 @@ fn parse_config(
 ## Simplified wiring example (you provide the fault handler, stack guard, and CS impl)
 
 ```rust
-use setback::{protect, recover, recovery_stack_top, ThreadId};
+use setback::{prepare_recovery, protect, recover, PreparedRecovery, ThreadId};
 
 const STACK_OVERFLOW: i32 = 1;
 const OOM: i32 = 2;
@@ -88,25 +89,23 @@ fn oom(_: core::alloc::Layout) -> ! {
 // overflow_trampoline in thread mode, on the scope's recovery stack.
 unsafe fn on_stack_overflow() {
     let tid = rtos_current_task() as ThreadId;
-    let Some(sp) = recovery_stack_top(tid, STACK_OVERFLOW) else {
+    let Some(prepared) = prepare_recovery(tid, STACK_OVERFLOW) else {
         halt(); // no scope to recover into
     };
     let f = __get_PSP() as *mut u32;
-    *f.add(0) = tid as u32;                    // r0 = tid
-    *f.add(1) = STACK_OVERFLOW as u32;         // r1 = cause
-    *f.add(2) = sp as u32;                     // r2 = recovery stack top
+    *f.add(2) = prepared.stack_top() as u32;   // r2 = recovery stack top
+    f.add(0).cast::<PreparedRecovery>().write(prepared); // r0 = token
     *f.add(6) = overflow_trampoline as u32;    // PC
 }
 
 // Reset SP (the overflowed stack is unusable) then enter thread-mode Rust.
 #[naked]
-extern "C" fn overflow_trampoline(tid: ThreadId, cause: i32) -> ! {
+extern "C" fn overflow_trampoline(prepared: PreparedRecovery) -> ! {
     unsafe { core::arch::asm!("mov sp, r2", "b overflow_enter", options(noreturn)) }
 }
 
-extern "C" fn overflow_enter(tid: ThreadId, cause: i32) -> ! {
-    unsafe { let _ = recover(tid, cause); }
-    loop { cortex_m::asm::bkpt() }
+extern "C" fn overflow_enter(prepared: PreparedRecovery) -> ! {
+    unsafe { prepared.recover() }
 }
 ```
 

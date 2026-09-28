@@ -46,7 +46,7 @@ use core::error::Error;
 use core::ffi::c_void;
 use core::mem::{ManuallyDrop, MaybeUninit};
 use core::panic::UnwindSafe;
-use core::ptr;
+use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 /// Identifier the caller uses to tag a `protect` scope and that the fault
@@ -149,7 +149,7 @@ static REGISTRY_HEAD: AtomicPtr<Mark> = AtomicPtr::new(ptr::null_mut());
 /// below the mark, touches its lowest byte, then arms the scope until `f`
 /// returns. Given a guard that faults precisely (MPU, `PSPLIM`, PMP), a thread
 /// short on headroom therefore faults while still unarmed. A handler may load
-/// [`recovery_stack_top`] into SP and run `recover` there: the recovery stack
+/// [`PreparedRecovery::stack_top`] into SP and recover there: the recovery stack
 /// and the abandoned frames of `f` below it are all free. The top is 16-byte
 /// aligned as at a call site, so on x86 a handler that enters a function
 /// directly leaves the return-address slot below it.
@@ -300,34 +300,60 @@ pub unsafe fn recover(tid: ThreadId, cause: i32) -> Result<Infallible, RecoveryF
 }
 
 /// Whether [`recover`] would find a scope: `true` when `tid` has an active
-/// [`protect`] scope that accepts `cause`. Shorthand for
-/// [`recovery_stack_top`]`(tid, cause).is_some()`, safe in the same contexts.
+/// [`protect`] scope that accepts `cause`. Safe to call from a fault handler,
+/// including one that preempts a critical section.
 pub fn can_recover(tid: ThreadId, cause: i32) -> bool {
-    recovery_stack_top(tid, cause).is_some()
-}
-
-/// Top of the recovery stack of the scope [`recover`] would jump into, or
-/// `None` when no active scope for `tid` accepts `cause`. A fault handler
-/// loads it into SP before resuming the thread at code that calls `recover`
-/// with the same `tid` and `cause`, see the "Recovery-stack guarantee" on
-/// [`protect`]. Valid until that scope ends. Safe to call from a
-/// fault handler, including one that preempts a critical section.
-pub fn recovery_stack_top(tid: ThreadId, cause: i32) -> Option<usize> {
     // SAFETY: `registry_find` needs every node it walks to stay alive, and the
     // critical section keeps every mutator out for the duration. A caller that
     // preempts the critical section instead of taking it - a fault handler -
     // has the mutator stopped mid-`protect`, so its mark cannot go away either.
-    critical_section::with(|_cs| unsafe {
-        let mark = registry_find(tid, cause);
-        if mark.is_null() {
-            return None;
-        }
-        // Another core may have disarmed the scope since the find.
-        match (*mark).recovery_stack_top.load(Ordering::Relaxed) {
-            0 => None,
-            top => Some(top),
-        }
+    critical_section::with(|_cs| unsafe { !registry_find(tid, cause).is_null() })
+}
+
+/// The scope [`recover`] would jump into, looked up ahead of the jump by
+/// [`prepare_recovery`]. FFI-safe: passes as a non-null pointer.
+#[repr(transparent)]
+pub struct PreparedRecovery(NonNull<Mark>);
+
+/// Split [`recover`] for a fault handler: look up the scope and record `cause`
+/// here, where stack is plentiful, then resume the thread with SP at
+/// [`PreparedRecovery::stack_top`] at code that calls
+/// [`PreparedRecovery::recover`]. `None` when no active scope for `tid` accepts
+/// `cause`.
+///
+/// # Safety
+/// - Call it from the thread `tid` or from a context that preempted it.
+/// - The result must not be used once its scope has ended.
+pub unsafe fn prepare_recovery(tid: ThreadId, cause: i32) -> Option<PreparedRecovery> {
+    // SAFETY: as in `can_recover`. The owning thread is not running, so the
+    // `cause` write does not race.
+    critical_section::with(|_cs| {
+        let mark = NonNull::new(registry_find(tid, cause))?;
+        (*mark.as_ptr()).cause = MaybeUninit::new(cause);
+        Some(PreparedRecovery(mark))
     })
+}
+
+impl PreparedRecovery {
+    /// Top of the scope's recovery stack, see the "Recovery-stack guarantee"
+    /// on [`protect`].
+    pub fn stack_top(&self) -> usize {
+        // SAFETY: the scope is live, see `prepare_recovery`.
+        unsafe { self.0.as_ref() }.recovery_stack_top.load(Ordering::Relaxed)
+    }
+
+    /// Jump into the prepared scope, as [`recover`] would.
+    ///
+    /// # Safety
+    /// As for [`recover`].
+    pub unsafe fn recover(self) -> ! {
+        // No closure frame and an inlined unlink: this runs on the recovery stack.
+        let mark = self.0.as_ptr();
+        let restore = critical_section::acquire();
+        registry_unlink_nested((*mark).tid, mark);
+        critical_section::release(restore);
+        setback_longjmp(JmpBufStorage::raw(&raw const (*mark).jmpbuf))
+    }
 }
 
 unsafe fn registry_push(node: *mut Mark) {
@@ -343,6 +369,7 @@ unsafe fn registry_push(node: *mut Mark) {
     REGISTRY_HEAD.store(node, Ordering::Release);
 }
 
+#[inline(always)]
 unsafe fn registry_unlink(node: *mut Mark) {
     let prev = (*node).prev;
     let next = (*node).next.load(Ordering::Relaxed);
@@ -370,6 +397,7 @@ unsafe fn registry_unlink(node: *mut Mark) {
 /// alive for the walk, so the caller must hold the critical section - it keeps
 /// the other mutators out, and this one splices nodes rather than only reading
 /// them, so it cannot run from a context that merely preempts them.
+#[inline(always)]
 unsafe fn registry_unlink_nested(tid: ThreadId, target: *mut Mark) {
     let mut p = REGISTRY_HEAD.load(Ordering::Acquire);
     while !p.is_null() && p != target {
