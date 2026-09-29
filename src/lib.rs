@@ -279,24 +279,10 @@ where
 /// - All leak / `protect` `# Safety` obligations apply to everything between
 ///   the fault point and the mark.
 pub unsafe fn recover(tid: ThreadId, cause: i32) -> Result<Infallible, RecoveryFailure> {
-    let jb = critical_section::with(|_cs| {
-        let mark = registry_find(tid, cause);
-        if mark.is_null() {
-            return ptr::null_mut();
-        }
-        // The jump abandons every scope for `tid` nested inside `mark`; their
-        // marks leave the list here, while it can still be walked safely.
-        registry_unlink_nested(tid, mark);
-        // Stash the cause while the node is locked-live, the matching `protect`
-        // reads it back after the jump. `recover` runs on the faulting thread
-        // and `protect` resumes on it, so the write and read do not race.
-        (*mark).cause = MaybeUninit::new(cause);
-        JmpBufStorage::raw(&raw const (*mark).jmpbuf)
-    });
-    if jb.is_null() {
-        return Err(RecoveryFailure);
+    match prepare_recovery(tid, cause) {
+        Some(prepared) => prepared.recover(),
+        None => Err(RecoveryFailure),
     }
-    setback_longjmp(jb)
 }
 
 /// Whether [`recover`] would find a scope: `true` when `tid` has an active
@@ -325,8 +311,9 @@ pub struct PreparedRecovery(NonNull<Mark>);
 /// - Call it from the thread `tid` or from a context that preempted it.
 /// - The result must not be used once its scope has ended.
 pub unsafe fn prepare_recovery(tid: ThreadId, cause: i32) -> Option<PreparedRecovery> {
-    // SAFETY: as in `can_recover`. The owning thread is not running, so the
-    // `cause` write does not race.
+    // SAFETY: as in `can_recover`. The caller is the owning thread or has it
+    // stopped, and `protect` reads `cause` back after the jump, so the write
+    // does not race.
     critical_section::with(|_cs| {
         let mark = NonNull::new(registry_find(tid, cause))?;
         (*mark.as_ptr()).cause = MaybeUninit::new(cause);
@@ -350,6 +337,8 @@ impl PreparedRecovery {
         // No closure frame and an inlined unlink: this runs on the recovery stack.
         let mark = self.0.as_ptr();
         let restore = critical_section::acquire();
+        // The jump abandons every scope for `tid` nested inside `mark`; their
+        // marks leave the list here, while it can still be walked safely.
         registry_unlink_nested((*mark).tid, mark);
         critical_section::release(restore);
         setback_longjmp(JmpBufStorage::raw(&raw const (*mark).jmpbuf))
