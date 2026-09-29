@@ -470,4 +470,22 @@ mod tests {
             assert!(!found());
         }
     }
+
+    #[test]
+    fn a_recovery_disarms_the_mark_it_lands_in() {
+        unsafe extern "C" fn jump(jb: *mut c_void) {
+            unsafe { setback_longjmp(jb) }
+        }
+
+        let jmpbuf = JmpBufStorage::new();
+        let top = AtomicUsize::new(0);
+
+        let outcome = unsafe {
+            let jb = JmpBufStorage::raw(&raw const jmpbuf);
+            setback_call(jb, top.as_ptr(), jump, jb)
+        };
+
+        assert_ne!(outcome, SETBACK_OK);
+        assert_eq!(top.load(Ordering::Relaxed), 0);
+    }
 }

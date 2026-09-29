@@ -6,8 +6,8 @@
  *
  *  * setjmp() runs in C, never Rust, and only as a controlling
  *    expression (C11 7.13.1.1p4), its result is never stored.
- *  * No local of the setjmp frame is written after setjmp returns or read on
- *    the resume path, so none can come back indeterminate (C11 7.13.2.1p3).
+ *  * No local of the setjmp frame is written after setjmp returns, so the
+ *    resume path reads them intact (C11 7.13.2.1p3).
  *  * longjmp() unwinds only this C frame back to its setjmp; the abandoned Rust
  *    frames above it are leaked by `protect`'s contract.
  *  * The mark is armed only while the setjmp frame and the recovery stack
@@ -92,7 +92,9 @@ __attribute__((noinline)) int32_t setback_call(void *jb,
     return SETBACK_OK;
   }
 
-  /* Reached via longjmp; the abandoned Rust frames are leaked by contract. */
+  /* Reached via longjmp; the abandoned Rust frames are leaked by contract.
+   * Disarm while the setjmp frame is still live. */
+  __atomic_store_n(top, 0, __ATOMIC_RELAXED);
   return SETBACK_RECOVERED;
 }
 
