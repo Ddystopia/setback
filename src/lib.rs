@@ -154,6 +154,18 @@ static REGISTRY_HEAD: AtomicPtr<Mark> = AtomicPtr::new(ptr::null_mut());
 /// aligned as at a call site, so on x86 a handler that enters a function
 /// directly leaves the return-address slot below it.
 ///
+/// The recovery stack carries everything between the handler's redirect and
+/// the jump: the caller's landing code, [`PreparedRecovery::recover`], and the
+/// `critical-section` implementation it calls. Built with optimizations, this
+/// crate takes 16 of the [`RECOVERY_STACK_BYTES`] on Armv7-M and the rest is
+/// the caller's. Built unoptimized it takes about 150 bytes. A `dev` profile
+/// keeps the caller's share by optimizing this crate:
+///
+/// ```toml
+/// [profile.dev.package.setback]
+/// opt-level = "s"
+/// ```
+///
 /// # Safety
 ///
 /// Recovery rewinds the stack pointer and runs no destructors: every frame `f`
@@ -329,13 +341,21 @@ impl PreparedRecovery {
         unsafe { self.0.as_ref() }.recovery_stack_top.load(Ordering::Relaxed)
     }
 
-    /// Jump into the prepared scope, as [`recover`] would.
+    /// Jump into the prepared scope: its [`protect`] returns
+    /// `Err(RecoveryError { cause })` with the prepared `cause`.
+    ///
+    /// Scopes nested inside it never return: the jump abandons their frames
+    /// and drops their marks from the registry.
     ///
     /// # Safety
-    /// As for [`recover`].
+    /// - Call it on the thread that owns the prepared scope, while that scope
+    ///   is live.
+    /// - All leak / `protect` `# Safety` obligations apply to everything between
+    ///   the fault point and the mark.
     pub unsafe fn recover(self) -> ! {
-        // No closure frame and an inlined unlink: this runs on the recovery stack.
         let mark = self.0.as_ptr();
+        // Runs on the recovery stack: the critical section is taken by hand and
+        // the unlink is inlined, which keeps this to one small frame.
         let restore = critical_section::acquire();
         // The jump abandons every scope for `tid` nested inside `mark`; their
         // marks leave the list here, while it can still be walked safely.
