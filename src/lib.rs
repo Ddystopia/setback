@@ -183,8 +183,11 @@ where
 }
 
 /// Like [`protect`], but only recovers when [`recover`]'s `cause` equals
-/// `cause`; any other cause skips this scope. See [`protect`] for the full
-/// contract.
+/// `cause`; any other cause skips this scope.
+///
+/// # Safety
+///
+/// The contract of [`protect`] applies in full.
 pub unsafe fn protect_cause<F, R>(
     tid: ThreadId,
     cause: i32,

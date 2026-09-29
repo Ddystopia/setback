@@ -24,7 +24,7 @@ fn stack_addr() -> usize {
 
 #[test]
 fn recovery_stack_size_is_aligned_and_nonzero() {
-    assert!(RECOVERY_STACK_BYTES >= SP_ALIGN);
+    const { assert!(RECOVERY_STACK_BYTES >= SP_ALIGN) };
     assert_eq!(RECOVERY_STACK_BYTES % SP_ALIGN, 0);
 }
 
